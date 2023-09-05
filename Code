@@ -1,0 +1,150 @@
+import dgl
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import dgl.function as fn
+from transformers import RobertaTokenizer, RobertaForSequenceClassification
+import json
+from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence
+
+
+class GNNLayer(nn.Module):
+    def __init__(self, in_dim, out_dim):
+        super(GNNLayer, self).__init__()
+        self.linear = nn.Linear(in_dim, out_dim)
+
+    def forward(self, g, features):
+        with g.local_scope():
+            g.ndata['h'] = features
+            g.update_all(fn.copy_u('h', 'm'), fn.mean('m', 'h'))
+            h_neigh = g.ndata['h']
+            h = self.linear(h_neigh)
+            return h
+
+# Function to batch dialogues
+def create_batches(dialogues, batch_size):
+    dialogue_batches = []
+    for i in range(0, len(dialogues), batch_size):
+        dialogue_batch = dialogues[i:i + batch_size]
+        dialogue_batches.append(dialogue_batch)
+    return dialogue_batches
+        
+def tokenize_utterance(utterance_text, max_seq_length, tokenizer):
+    tokens = tokenizer.tokenize(utterance_text)
+    tokens = tokens[:max_seq_length]
+    input_ids = tokenizer.convert_tokens_to_ids(tokens)
+    return torch.tensor(input_ids).unsqueeze(0), len(tokens)
+
+def predict_emotion(input_ids, emotion_model):
+    with torch.no_grad():
+        logits = emotion_model(input_ids).logits
+    probabilities = torch.softmax(logits, dim=1)
+    predicted_emotion = torch.argmax(probabilities, dim=1).item()
+    return predicted_emotion
+
+def process_dialogue(dialogue, max_seq_length, tokenizer, emotion_model, emotion_classes):
+    constructed_dialogue = []
+    max_dialogue_seq_length = 0
+    
+    
+    # Flatten the list of lists into a simple list
+    flat_dialogue = [item for sublist in dialogue for item in sublist]
+    
+    for utterance_data in flat_dialogue:
+        utterance_text = utterance_data.get("utterance", "")
+        emotion_cause = " ".join(utterance_data.get("expanded emotion cause span", []))
+
+
+        input_ids, seq_length = tokenize_utterance(utterance_text, max_seq_length, tokenizer)
+        max_dialogue_seq_length = max(max_dialogue_seq_length, seq_length)
+
+        predicted_emotion = predict_emotion(input_ids, emotion_model)
+        predicted_emotion_label = emotion_classes[predicted_emotion]
+
+        constructed_utterance = {
+            'tokens': input_ids,
+            'emotion_prediction': predicted_emotion_label,
+            'emotion_cause': emotion_cause
+        }
+        constructed_dialogue.append(constructed_utterance)
+        num_utterances = len(constructed_dialogue)
+        g = dgl.graph(([], []), num_nodes=num_utterances)
+
+        src_nodes = []
+        dst_nodes = []
+        
+        for i in range(num_utterances):
+            for j in range(i+1, num_utterances):
+                src_nodes.append(i)
+                dst_nodes.append(j)
+                src_nodes.append(j)
+                dst_nodes.append(i)
+
+        g.add_edges(src_nodes, dst_nodes)
+            
+    node_features = []
+    for utterance in constructed_dialogue:
+        emotion_one_hot = [0.0] * len(emotion_classes)
+        emotion_idx = emotion_classes.index(utterance['emotion_prediction'])
+        emotion_one_hot[emotion_idx] = 1.0
+        node_features.append(emotion_one_hot)
+
+    g.ndata['feat'] = torch.tensor(node_features)
+    return g, constructed_dialogue, max_dialogue_seq_length
+
+# Example usage
+#Define emotion classes as a list
+emotion_classes = ["anger", "disgust", "fear", "happy", "neutral", "sad", "surprise"] 
+ # Add all your emotion classes here
+input_dim = len(emotion_classes)
+output_dim = 16  # Or whatever size you want for the output features
+
+# Initialize GNN model
+gnn_model = GNNLayer(input_dim, output_dim)
+
+# Define dialogues (list of dialogues, where each dialogue is a list of utterances)
+# This is just a placeholder, replace it with your actual dialogues
+with open('dailydialog_train.json', 'r') as f:
+    data = json.load(f)
+
+dialogues = list(data.values())  # Convert the dialogues to a list
+
+max_seq_length = 128
+
+# Replace these with your actual tokenizer and emotion_model
+# Load RoBERTa tokenizer and pre-trained model for emotion classification
+tokenizer = RobertaTokenizer.from_pretrained('roberta-base')
+num_emotion_labels = 7  # Replace with the actual number of emotion labels
+emotion_model = RobertaForSequenceClassification.from_pretrained('roberta-base', num_labels=num_emotion_labels)
+# Set batch size
+batch_size = 32
+
+# Create dialogue batches
+dialogue_batches = create_batches(dialogues, batch_size)
+
+# Process batches
+for batch_num, dialogue_batch in enumerate(dialogue_batches):
+    batch_graphs = []
+    batch_constructed_dialogues = []
+    batch_max_dialogue_seq_lengths = []
+
+    for dialogue in dialogue_batch:
+        g, constructed_dialogue, max_dialogue_seq_length = process_dialogue(
+            dialogue, max_seq_length, tokenizer, emotion_model, emotion_classes
+        )
+        batch_graphs.append(g)
+        batch_constructed_dialogues.append(constructed_dialogue)
+        batch_max_dialogue_seq_lengths.append(max_dialogue_seq_length)
+
+    # Now you can combine these graphs and dialogues into a single batch
+    # You can also perform any necessary padding for your sequences here based on batch_max_dialogue_seq_lengths
+    batched_graph = dgl.batch(batch_graphs)
+
+    node_features = batched_graph.ndata['feat']
+    updated_node_features = gnn_model(batched_graph, node_features)
+
+    print(f'Batch {batch_num+1} - Constructed Dialogues: {batch_constructed_dialogues}')
+    print(f'Batch {batch_num+1} - Graph Node Features: {node_features}')
+    print(f'Batch {batch_num+1} - Updated Node Features: {updated_node_features}')
+
+    print(constructed_dialogue, updated_node_features)
