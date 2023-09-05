@@ -1,0 +1,65 @@
+import dgl
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import dgl.function as fn
+from transformers import RobertaTokenizer, RobertaForSequenceClassification
+import json
+from torch.utils.data import DataLoader
+from sklearn.preprocessing import LabelEncoder
+import numpy as np
+
+# Initialize Tokenizer and Emotion Classification Model
+tokenizer = RobertaTokenizer.from_pretrained('roberta-base')
+emotion_model = RobertaForSequenceClassification.from_pretrained('roberta-base', num_labels=7)
+
+# Constants
+emotion_classes = ["anger", "disgust", "fear", "happy", "neutral", "sad", "surprise"]
+input_dim = len(emotion_classes)
+output_dim = 16  
+batch_size = 32
+max_seq_length = 128
+
+# Load data
+try:
+    with open('dailydialog_train.json', 'r') as f:
+        data = json.load(f)
+except FileNotFoundError:
+    print("File not found.")
+    exit(1)
+except json.JSONDecodeError:
+    print("Error decoding JSON.")
+    exit(1)
+
+dialogues = list(data.values())
+
+# Define Model
+class GNNLayer(nn.Module):
+    def __init__(self, in_dim, out_dim):
+        super(GNNLayer, self).__init__()
+        self.linear = nn.Linear(in_dim, out_dim)
+
+    def forward(self, g, features):
+        with g.local_scope():
+            g.ndata['h'] = features
+            g.update_all(fn.copy_u('h', 'm'), fn.mean('m', 'h'))
+            h_neigh = g.ndata['h']
+            h = self.linear(h_neigh)
+            return h
+
+class EmotionCauseClassifier(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super(EmotionCauseClassifier, self).__init__()
+        self.fc1 = nn.Linear(input_dim, 128)
+        self.fc2 = nn.Linear(128, output_dim)
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x
+
+# Initialize Models
+gnn_model = GNNLayer(input_dim, output_dim)
+emotion_cause_classifier = EmotionCauseClassifier(output_dim, len(emotion_classes))
+
+
